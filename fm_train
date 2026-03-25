@@ -1,0 +1,377 @@
+import os
+
+os.environ["MPLCONFIGDIR"] = "/path/to/log_dir"
+import argparse
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+from torchcfm.conditional_flow_matching import ConditionalFlowMatcher, TargetConditionalFlowMatcher, \
+    ExactOptimalTransportConditionalFlowMatcher
+from torchcfm.models.unet.unet import UNetModel
+
+from dataset import get_dataloader_single
+from fm_train.losses import SingleHeadResNet, create_backbone, get_quality_loss_weight, \
+    compute_single_step_quality_loss_3D
+
+
+def compute_inner_loop_quality_loss_gradient_accumulation(model, x_t, t, cond, x0,
+                                                          classifier, prototypes,
+                                                          loss_type, device, optimizer,
+                                                          scaler,
+                                                          inner_loop_steps,
+                                                          quality_start_step,
+                                                          current_quality_weight=1.0,
+                                                          accumulation_steps=3):
+    
+    trajectory = []
+    current_img = x_t.clone()
+
+    with torch.no_grad():
+        for step in range(inner_loop_steps):
+            t_current = step / inner_loop_steps
+            t_batch = torch.ones(current_img.size(0), device=device) * t_current
+
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                v_pred = model(t_batch, current_img)
+
+            dt = 1.0 / inner_loop_steps
+            current_img = current_img + v_pred * dt
+            current_img = current_img.clamp(-1.0, 1.0)
+            trajectory.append(current_img.clone())
+
+    total_quality_loss = 0.0
+    optimized_steps = 0
+    accumulated_loss = 0.0
+
+    for step in range(quality_start_step, inner_loop_steps):
+        if step == quality_start_step:
+            current_img_opt = trajectory[quality_start_step - 1].clone().requires_grad_(True)
+        else:
+            current_img_opt = current_img_opt.detach().requires_grad_(True)
+
+        t_current = step / inner_loop_steps
+        t_batch = torch.ones(current_img_opt.size(0), device=device) * t_current
+
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            v_pred = model(t_batch, current_img_opt)
+            dt = 1.0 / inner_loop_steps
+            next_img = torch.tanh(current_img_opt + v_pred * dt)
+
+            step_weight = ((step - quality_start_step + 1) /
+                           (inner_loop_steps - quality_start_step)) ** 2
+
+            step_quality_loss = compute_single_step_quality_loss_3D(
+                next_img, classifier, prototypes, loss_type, device
+            )
+            weighted_loss = current_quality_weight * step_weight * step_quality_loss / accumulation_steps
+
+        scaler.scale(weighted_loss).backward()
+        accumulated_loss += weighted_loss.item()
+
+        total_quality_loss += step_quality_loss.item()
+        optimized_steps += 1
+
+        if (step - quality_start_step + 1) % accumulation_steps == 0 or step == inner_loop_steps - 1:
+            
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            accumulated_loss = 0.0
+
+        current_img_opt = next_img.detach()
+
+        del step_quality_loss, weighted_loss, v_pred, next_img
+        torch.cuda.empty_cache()
+
+    avg_quality_loss = total_quality_loss / optimized_steps if optimized_steps > 0 else 0.0
+    return avg_quality_loss
+
+
+class FlowMatchingTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        print("Loading data...")
+        (self.train_source_loader, self.train_target_loader,
+         self.val_source_loader, self.val_target_loader,
+         self.test_source_loader, self.test_target_loader) = get_dataloader_single(
+            "/path/to/data_dir",
+            batch_size=args.batch_size
+        )
+
+        self.setup_flow_matcher()
+
+        print(f"Creating UNet Model with image_size={args.image_size}...")
+        self.model = UNetModel(
+            image_size=args.image_size,
+            in_channels=1,
+            model_channels=args.model_channels,
+            out_channels=1,
+            num_res_blocks=args.num_res_blocks,
+            attention_resolutions=(16,),
+            channel_mult=(1, 2, 4, 8), 
+            dims=3,
+            num_classes=None,
+            num_heads=args.num_heads
+        ).to(self.device)
+
+        print("Loading Quality Classifier for Training Loss...")
+        self.loss_type = args.loss_type
+        self.classifier, self.prototypes = self.load_quality_models()
+        if self.classifier:
+            self.classifier.eval()
+            self.classifier.to(self.device)
+
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr)
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.output_dir = Path(args.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.images_dir = self.output_dir / "val_images"
+        self.images_dir.mkdir(exist_ok=True)
+
+        self.log_file = self.output_dir / "train_log.csv"
+        self._init_log_file()
+
+        self.val_every = args.val_every
+        self.save_every = args.save_every
+        self.max_epochs = args.epochs
+        self.global_step = 0
+
+    def _init_log_file(self):
+        if not self.log_file.exists():
+            with open(self.log_file, 'w') as f:
+                f.write("epoch,total_loss,fm_loss,quality_loss,quality_weight\n")
+
+    def _save_log(self, epoch, total_loss, fm_loss, quality_loss, quality_weight):
+        with open(self.log_file, 'a') as f:
+            f.write(f"{epoch},{total_loss:.6f},{fm_loss:.6f},{quality_loss:.6f},{quality_weight:.6f}\n")
+
+    def setup_flow_matcher(self):
+        args = self.args
+        if args.flow_matcher_type == "ot":
+            self.flow_matcher = ExactOptimalTransportConditionalFlowMatcher(sigma=args.sigma)
+        elif args.flow_matcher_type == "target":
+            self.flow_matcher = TargetConditionalFlowMatcher(sigma=args.sigma)
+        elif args.flow_matcher_type == "rectified":
+            self.flow_matcher = ConditionalFlowMatcher(sigma=0.0)
+        else:
+            self.flow_matcher = ConditionalFlowMatcher(sigma=args.sigma)
+
+    def load_quality_models(self):
+        classifier_path = self.args.classifier_path
+        prototypes_path = self.args.prototypes_path
+        pretrained_path = self.args.pretrained_path
+
+        if not (classifier_path and prototypes_path and pretrained_path):
+            print("Warning: Quality model paths not provided. Quality loss will be disabled.")
+            return None, None
+
+        try:
+            backbone = create_backbone(pretrained_path=pretrained_path, feature_dim=512).to(self.device)
+            classifier = SingleHeadResNet(backbone, num_classes=2, feature_dim=512).to(self.device)
+
+            checkpoint = torch.load(classifier_path, map_location=self.device, weights_only=False)
+            classifier.load_state_dict(checkpoint['model_state_dict'])
+
+            prototypes = None
+            if os.path.exists(prototypes_path):
+                prototypes_data = np.load(prototypes_path)
+                prototypes = torch.from_numpy(prototypes_data).to(self.device)
+
+            print("Quality models loaded successfully.")
+            return classifier, prototypes
+        except Exception as e:
+            print(f"Error loading quality models: {e}")
+            return None, None
+
+    def train_one_epoch(self, epoch_index):
+        self.model.train()
+        total_fm_loss = 0.0
+        total_quality_loss = 0.0
+        steps = len(self.train_source_loader)
+
+        current_quality_weight = get_quality_loss_weight(self.args, epoch_index, self.max_epochs)
+
+        for step, (source_batch, target_batch) in enumerate(zip(self.train_source_loader, self.train_target_loader)):
+            source_img, _ = source_batch
+            target_img, _ = target_batch
+
+            source_img = source_img.to(self.device)
+            target_img = target_img.to(self.device)
+
+            if len(source_img.shape) == 4:
+                source_img = source_img.unsqueeze(1)
+                target_img = target_img.unsqueeze(1)
+
+            self.optimizer.zero_grad()
+            t = torch.rand(source_img.size(0), device=self.device)
+            _, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(source_img, target_img, t)
+
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                 pred_v = self.model(t, xt)
+                 fm_loss = torch.mean((pred_v - ut) ** 2)
+
+            self.scaler.scale(fm_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            total_fm_loss += fm_loss.item()
+
+            quality_loss = 0.0
+            if self.args.use_quality_loss and self.classifier is not None and self.prototypes is not None:
+                avg_quality_loss = compute_inner_loop_quality_loss_gradient_accumulation(
+                        model=self.model,
+                        x_t=xt.detach(),
+                        t=None, cond=None, x0=None,
+                        classifier=self.classifier,
+                        prototypes=self.prototypes,
+                        loss_type=self.loss_type,
+                        device=self.device,
+                        optimizer=self.optimizer,
+                        scaler=self.scaler,
+                        inner_loop_steps=self.args.inner_loop_steps,
+                        quality_start_step=self.args.quality_start_step,
+                        current_quality_weight=current_quality_weight,
+                        accumulation_steps=self.args.accumulation_steps,
+                )
+                quality_loss = avg_quality_loss
+                total_quality_loss += avg_quality_loss
+
+            self.global_step += 1
+
+            if step % 10 == 0:
+                print(f"[Epoch {epoch_index} Step {step}] FM Loss: {fm_loss.item():.4e}, "
+                      f"Q-Weight: {current_quality_weight:.2f}, Q-Loss: {quality_loss:.4e}")
+
+        avg_fm_loss = total_fm_loss / steps
+        avg_quality_loss = total_quality_loss / max(steps, 1)
+        avg_total_loss = avg_fm_loss + avg_quality_loss
+
+        self._save_log(epoch_index, avg_total_loss, avg_fm_loss, avg_quality_loss, current_quality_weight)
+        return avg_total_loss
+
+    @torch.no_grad()
+    def save_sample_snapshot(self, epoch):
+        self.model.eval()
+        try:
+            source_batch = next(iter(self.val_source_loader))
+            source_img = source_batch[0].to(self.device)
+            if len(source_img.shape) == 4: source_img = source_img.unsqueeze(1)
+
+            current_img = source_img.clone()
+            num_steps = 20
+            dt = 1.0 / num_steps
+            for i in range(num_steps):
+                t = torch.ones(source_img.size(0), device=self.device) * (i / num_steps)
+
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    v_pred = self.model(t, current_img)
+
+                current_img = current_img + v_pred * dt
+                current_img = torch.clamp(current_img, -1.0, 1.0) 
+
+            mid_slice_idx = current_img.shape[2] // 2
+            img_slice = current_img[0, 0, mid_slice_idx].cpu().numpy()
+
+            img_slice = (img_slice + 1) / 2
+            img_slice = np.clip(img_slice, 0, 1)
+
+            plt.figure(figsize=(5, 5))
+            plt.imshow(img_slice, cmap='gray')
+            plt.title(f"Epoch {epoch}")
+            plt.axis('off')
+            plt.savefig(self.images_dir / f"epoch_{epoch:03d}.png")
+            plt.close()
+            print(f"Saved visual snapshot to {self.images_dir / f'epoch_{epoch:03d}.png'}")
+
+        except Exception as e:
+            print(f"Snapshot generation failed: {e}")
+
+    def save_checkpoint(self, epoch):
+        ckpt_dir = self.output_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"ckpt_{epoch:04d}.pt"
+
+        to_save = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": epoch + 1,
+            "args": self.args
+        }
+        torch.save(to_save, ckpt_path)
+        print(f"Saved checkpoint: {ckpt_path}")
+
+    def train(self):
+        for epoch in range(self.max_epochs):
+            print(f"--- Epoch {epoch + 1}/{self.max_epochs} ---")
+
+            self.train_one_epoch(epoch)
+
+            if ((epoch + 1) % self.val_every) == 0:
+                self.save_sample_snapshot(epoch)
+
+            if ((epoch + 1) % self.save_every) == 0:
+                self.save_checkpoint(epoch)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="3D Flow Matching Training")
+
+    parser.add_argument('--output_dir', type=str, default="./results_fm_128")
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--val_every', type=int, default=1)
+    parser.add_argument('--save_every', type=int, default=10)
+
+    parser.add_argument('--image_size', type=int, default=128,
+                        help='Input image resolution')
+
+    parser.add_argument('--model_channels', type=int, default=32)
+    parser.add_argument('--num_res_blocks', type=int, default=2)
+    parser.add_argument('--num_heads', type=int, default=1)
+    parser.add_argument('--flow_matcher_type', type=str, default="ot")
+    parser.add_argument('--sigma', type=float, default=0.1)
+
+    parser.add_argument('--use_quality_loss', action='store_true', default=True)
+    parser.add_argument('--loss_type', type=str, default="mixed")
+    parser.add_argument('--quality_loss_weight', type=float, default=1.0)
+    parser.add_argument('--inner_loop_steps', type=int, default=20)
+    parser.add_argument('--quality_start_step', type=int, default=10)
+    parser.add_argument('--accumulation_steps', type=int, default=3)
+
+    parser.add_argument('--classifier_path', type=str,
+                        default="/path/to/encoder/best_encoder.pth")
+    parser.add_argument('--prototypes_path', type=str,
+                        default="/path/to/encoder/best_prototypes.npy")
+    parser.add_argument('--pretrained_path', type=str,
+                        default="/path/to/pretrained/resnet_18_23dataset.pth")
+
+    args = parser.parse_args()
+    return args
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "args.json"), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
+    trainer = FlowMatchingTrainer(args)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
