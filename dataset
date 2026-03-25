@@ -1,0 +1,140 @@
+import os
+
+os.environ["MPLCONFIGDIR"] = "/path/to/log_dir"
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import SimpleITK as sitk
+import glob
+
+def robust_normalize(img_tensor, percentiles=(1, 99)):
+    p_low, p_high = np.percentile(img_tensor.numpy(), percentiles)
+    img_tensor = torch.clamp(img_tensor, p_low, p_high)
+    img_normalized = (img_tensor - p_low) / (p_high - p_low + 1e-8)
+
+    return img_normalized
+
+def preprocess_image_sitk(img_path, target_size=(128, 128, 32)):
+    img_sitk = sitk.ReadImage(str(img_path))
+    img_array = sitk.GetArrayFromImage(img_sitk)  
+
+    D_orig = img_array.shape[0]
+    target_D = target_size[2]
+
+    if D_orig >= target_D:
+        start = D_orig // 2 - target_D // 2
+        img_array = img_array[start: start + target_D]
+    else:
+        pad_w = (target_D - D_orig) // 2
+        pad_rem = target_D - D_orig - pad_w
+        img_array = np.pad(img_array, ((pad_w, pad_rem), (0, 0), (0, 0)), 'constant')
+
+    img_crop_sitk = sitk.GetImageFromArray(img_array)
+    original_size = img_crop_sitk.GetSize()
+    original_spacing = img_crop_sitk.GetSpacing()
+
+    new_size_sitk = [target_size[0], target_size[1], target_size[2]]  
+    new_spacing = [
+        original_spacing[0] * original_size[0] / new_size_sitk[0],
+        original_spacing[1] * original_size[1] / new_size_sitk[1],
+        original_spacing[2] * original_size[2] / new_size_sitk[2]
+    ]
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize(new_size_sitk)
+    resampler.SetOutputSpacing(new_spacing)
+    resampler.SetOutputOrigin(img_crop_sitk.GetOrigin())
+    resampler.SetOutputDirection(img_crop_sitk.GetDirection())
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(0)
+
+    img_resized = resampler.Execute(img_crop_sitk)
+    img_array_final = sitk.GetArrayFromImage(img_resized)  
+
+    img_tensor = torch.from_numpy(img_array_final).float()
+    img_tensor = robust_normalize(img_tensor, percentiles=(0.5, 99.5))
+    img_tensor = img_tensor * 2 - 1 
+
+    return img_tensor.unsqueeze(0)
+
+def get_file_list(base_dir, sub_dir, file_pattern="*.nii*"):
+    path = os.path.join(base_dir, sub_dir)
+    files = sorted(glob.glob(os.path.join(path, file_pattern)))
+    if len(files) == 0:
+        print(f"Warning: No files found in {path}")
+    return files
+
+class SingleChannelDataset(Dataset):
+    def __init__(self, dwi_paths, labels):
+        self.dwi_paths = dwi_paths
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.dwi_paths)
+
+    def __getitem__(self, idx):
+        image = preprocess_image_sitk(self.dwi_paths[idx])
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return image, label
+
+def get_dataloader_single(base, batch_size):
+    print(">>> Building B-value vocabulary...")
+    all_files = []
+    all_files += glob.glob(f"{base}/source/*.nii*")
+    all_files += glob.glob(f"{base}/target/*.nii*")
+
+    s_dwi0 = get_file_list(base, "source")
+    s_dwi1 = get_file_list(base, "target")
+    src_lbl0 = [0] * len(s_dwi0)
+    src_lbl1 = [1] * len(s_dwi0)
+
+    source_ds_train = SingleChannelDataset(s_dwi0, src_lbl0)
+    target_ds_train = SingleChannelDataset(s_dwi1, src_lbl1)
+
+    train_source_loader = DataLoader(
+        target_ds_train,
+        batch_size=batch_size,
+        num_workers=0
+    )
+
+    train_target_loader = DataLoader(
+        source_ds_train,
+        batch_size=batch_size,
+        num_workers=0
+    )
+
+    def load_source_v(base_sub):
+        base_q = os.path.join(base, base_sub)
+        return get_file_list(base_q, "s_v")
+
+    def load_target_v(base_sub):
+        base_s = os.path.join(base, base_sub)
+        return get_file_list(base_s, "t_v")
+
+    s_v = load_source_v("g_t")
+    t_v = load_target_v("g_t")
+    source_ds_val = SingleChannelDataset(s_v, [0] * len(s_v))
+    target_ds_val = SingleChannelDataset(t_v, [1] * len(t_v))
+
+    val_source_loader = DataLoader(target_ds_val, batch_size=1, shuffle=False)
+    val_target_loader = DataLoader(source_ds_val, batch_size=1, shuffle=False)
+
+    def load_source_t(base_sub):
+        base_q = os.path.join(base, base_sub)
+        return get_file_list(base_q, "s_t")
+
+    def load_target_t(base_sub):
+        base_s = os.path.join(base, base_sub)
+        return get_file_list(base_s, "t_t")
+
+    s_t = load_source_t("g_t")
+    t_t = load_target_t("g_t")
+    source_ds_test = SingleChannelDataset(s_t, [0] * len(s_t))
+    target_ds_test = SingleChannelDataset(t_t, [1] * len(t_t))
+
+    test_source_loader = DataLoader(target_ds_test, batch_size=1, shuffle=False)
+    test_target_loader = DataLoader(source_ds_test, batch_size=1, shuffle=False)
+
+    print(f"Train Source: {len(source_ds_train)} | Target: {len(target_ds_train)}")
+
+    return train_source_loader, train_target_loader, val_source_loader, val_target_loader, test_source_loader, test_target_loader
