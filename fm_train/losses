@@ -1,0 +1,142 @@
+import torch
+import torch.nn as nn
+import os
+
+os.environ["MPLCONFIGDIR"] = "/path/to/log_dir"
+import torch.nn.functional as F
+from .resnet import ResNet, BasicBlock
+
+def create_backbone(pretrained_path=None, feature_dim=512):
+    block = BasicBlock
+    layers = [2, 2, 2, 2]  
+
+    backbone = ResNet(
+        block=block,
+        layers=layers,
+        sample_input_D=64,
+        sample_input_H=64,
+        sample_input_W=64,
+        num_seg_classes=feature_dim,
+        shortcut_type='B',
+        no_cuda=False
+    )
+
+    if pretrained_path is not None and os.path.exists(pretrained_path):
+        state_dict = torch.load(pretrained_path, map_location="cpu")
+        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        missing, unexpected = backbone.load_state_dict(new_state_dict, strict=False)
+        print(f"Loaded pretrained backbone. Missing: {missing}, Unexpected: {unexpected}")
+
+    return backbone
+
+
+class SingleHeadResNet(nn.Module):
+    def __init__(self, backbone, num_classes=2, feature_dim=512):
+        super(SingleHeadResNet, self).__init__()
+        self.backbone = backbone
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features_pooled = self.avgpool(features)
+        features_flat = features_pooled.view(features_pooled.size(0), -1)
+        output = self.classifier(features_flat)
+        return output, features_flat
+
+
+def get_quality_loss_weight(args, epoch, total_epochs):
+    ramp_up_epochs = min(50, total_epochs // 2)  
+    if epoch < ramp_up_epochs:
+        progress = epoch / ramp_up_epochs
+        return args.quality_loss_weight * progress
+    else:
+        return args.quality_loss_weight
+
+
+def compute_single_step_quality_loss_3D(generated_img, classifier, prototypes,
+                                     loss_type, device):
+    if loss_type == "none":
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    elif loss_type == "classifier":
+        return classifier_loss_3D(generated_img, classifier, device)
+    elif loss_type == "proto":
+        return prototype_loss_3D(generated_img, prototypes, classifier, device)
+    elif loss_type == "mixed":
+        class_loss = classifier_loss_3D(generated_img, classifier, device)
+        proto_loss = prototype_loss_3D(generated_img, prototypes, classifier, device)
+        return class_loss + proto_loss
+
+
+def classifier_loss_3D(generated_img, classifier, device):
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad = False
+
+    outputs, _ = classifier(generated_img)
+
+    target = torch.ones(generated_img.size(0), device=device, dtype=torch.long)
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(outputs, target)
+    return loss
+
+
+def prototype_loss_3D(generated_img, prototypes, classifier, device, margin_scale=0.2):
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad = False
+
+    proto_0 = F.normalize(prototypes[0].to(device), dim=0)
+    proto_1 = F.normalize(prototypes[1].to(device), dim=0)
+
+    _, features = classifier(generated_img)
+
+    features = F.normalize(features, dim=1)
+
+    sim_to_0 = torch.sum(features * proto_0.unsqueeze(0), dim=1)   
+    sim_to_1 = torch.sum(features * proto_1.unsqueeze(0), dim=1)   
+
+    raw_margin = (sim_to_0 - sim_to_1).mean().detach()
+    auto_margin = margin_scale * torch.relu(raw_margin)
+
+    loss = F.relu(auto_margin + sim_to_0 - sim_to_1).mean()
+
+    return loss
+
+
+class CosinePrototypeLoss(nn.Module):
+    def __init__(self, margin_scale=0.2, temperature=0.1):
+        super(CosinePrototypeLoss, self).__init__()
+        self.margin_scale = margin_scale
+        self.temperature = temperature
+
+    def forward(self, features, prototypes, labels):
+        batch_size = features.size(0)
+
+        f_norm = F.normalize(features, p=2, dim=1)       
+        p_norm = F.normalize(prototypes, p=2, dim=1)     
+
+        cosine_sim = torch.matmul(f_norm, p_norm.T)      
+        cosine_dist = 1.0 - cosine_sim                  
+
+        pos_dist = cosine_dist[torch.arange(batch_size), labels]   
+
+        neg_mask = torch.ones_like(cosine_dist, dtype=torch.bool)
+        neg_mask[torch.arange(batch_size), labels] = False
+        neg_dists = cosine_dist[neg_mask].view(batch_size, -1)     
+
+        avg_dist = cosine_dist.mean().detach()
+        margin = self.margin_scale * avg_dist
+
+        hardest_neg = neg_dists.min(dim=1).values   
+
+        loss = F.relu(pos_dist - hardest_neg + margin)
+
+        return loss.mean()
